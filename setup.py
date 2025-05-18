@@ -15,7 +15,7 @@ setup(
     name="job_scraper",
     version="1.0.0",
     author="Your Name",
-    author_email="your.email@example.com",
+    author_email="prasanna.a1.usage@gmail.com",
     description="A tool for scraping job listings from multiple job portals",
     long_description=long_description,
     long_description_content_type="text/markdown",
