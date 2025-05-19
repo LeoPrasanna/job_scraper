@@ -65,9 +65,19 @@ def get_google_credentials():
     """
     Get Google API credentials from environment or file.
     
+    Note: This function is maintained for backward compatibility.
+    For Workload Identity Federation, use the default credentials
+    mechanism instead.
+    
     Returns:
-        str: Path to credentials file or JSON string
+        str: Path to credentials file or JSON string or None if using Workload Identity
     """
+    # Check if we're using Workload Identity Federation
+    if os.getenv('WORKLOAD_IDENTITY_PROVIDER') and os.getenv('GCP_SERVICE_ACCOUNT'):
+        # We're probably running in GitHub Actions with Workload Identity
+        # Return None to indicate that we should use default credentials
+        return None
+    
     # Check for credentials in environment variable
     creds_json = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
     if creds_json:
@@ -82,9 +92,18 @@ def get_google_credentials():
         
         return creds_path
     
-    # Check for credentials file
-    creds_path = os.path.join('credentials', 'service-account-key.json')
-    if os.path.exists(creds_path):
-        return creds_path
+    # Check common locations for credentials file
+    potential_paths = [
+        os.path.join('credentials', 'service-account-key.json'),
+        os.path.join('credentials', 'client_secret.json'),
+        os.path.join(os.path.expanduser('~'), '.config', 'gcloud', 'application_default_credentials.json'),
+        os.path.join(os.path.expanduser('~'), '.config', 'gcloud', 'service-account-key.json'),
+        os.path.join(os.getcwd(), 'service-account-key.json'),
+        os.path.join(os.getcwd(), 'client_secret.json')
+    ]
+    
+    for path in potential_paths:
+        if os.path.exists(path):
+            return path
     
     return None

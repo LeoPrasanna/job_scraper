@@ -5,10 +5,44 @@ on:
     # Run daily at midnight UTC
     - cron: '0 0 * * *'
   workflow_dispatch:  # Allows manual triggering
+    inputs:
+      job_titles:
+        description: 'Job titles to search (comma-separated)'
+        required: false
+        default: ''
 
 jobs:
-  scrape:
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      job_titles: ${{ steps.set-titles.outputs.job_titles }}
+    steps:
+      - name: Set job titles
+        id: set-titles
+        run: |
+          # Use input job titles if provided, otherwise use repository variable or default
+          if [[ -n "${{ github.event.inputs.job_titles }}" ]]; then
+            TITLES="${{ github.event.inputs.job_titles }}"
+          else
+            TITLES="${{ vars.JOB_TITLES || 'Data Scientist' }}"
+          fi
+          
+          # Convert comma-separated string to JSON array
+          TITLES_JSON="$(echo $TITLES | jq -R -s -c 'split(",")')"
+          echo "job_titles=$TITLES_JSON" >> $GITHUB_OUTPUT
+          echo "Job titles to process: $TITLES_JSON"
+
+  scrape:
+    needs: setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'  # Needed for Workload Identity Federation
+    
+    strategy:
+      matrix:
+        job_title: ${{ fromJson(needs.setup.outputs.job_titles) }}
+      fail-fast: false  # Continue with other matrix jobs even if one fails
     
     steps:
       - name: Checkout code
@@ -31,25 +65,125 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run job scraper
-        env:
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+      
+      - name: Run job scraper for ${{ matrix.job_title }}
         run: |
+          # Get all settings from repository variables
+          LOCATION="${{ vars.JOB_LOCATION || 'India' }}"
+          OUTPUT="${{ vars.OUTPUT_FORMAT || 'google_sheets' }}"
+          
+          # Build skip flags based on repository variables
+          SKIP_FLAGS=""
+          
+          # For LinkedIn
+          if [[ "${{ vars.RUN_LINKEDIN || 'true' }}" == "false" ]]; then
+            SKIP_FLAGS="$SKIP_FLAGS --skip-linkedin"
+          fi
+          
+          # For Naukri
+          if [[ "${{ vars.RUN_NAUKRI || 'true' }}" == "false" ]]; then
+            SKIP_FLAGS="$SKIP_FLAGS --skip-naukri"
+          fi
+          
+          # For TimesJobs
+          if [[ "${{ vars.RUN_TIMESJOBS || 'true' }}" == "false" ]]; then
+            SKIP_FLAGS="$SKIP_FLAGS --skip-timesjobs"
+          fi
+          
+          # For Foundit
+          if [[ "${{ vars.RUN_FOUNDIT || 'true' }}" == "false" ]]; then
+            SKIP_FLAGS="$SKIP_FLAGS --skip-foundit"
+          fi
+          
+          # For Glassdoor
+          if [[ "${{ vars.RUN_GLASSDOOR || 'false' }}" == "false" ]]; then
+            SKIP_FLAGS="$SKIP_FLAGS --skip-glassdoor"
+          fi
+          
+          # Create sanitized job title for filenames
+          SANITIZED_TITLE=$(echo "${{ matrix.job_title }}" | tr ' ' '_' | tr -d '[:punct:]')
+          
+          echo "Running job scraper for: ${{ matrix.job_title }}"
+          echo "Location: $LOCATION"
+          echo "Output format: $OUTPUT"
+          echo "Skip flags: $SKIP_FLAGS"
+          
+          # Additional parameters from repository variables
+          LINKEDIN_PAGES="${{ vars.LINKEDIN_PAGES || '8' }}"
+          LINKEDIN_MIN_JOBS="${{ vars.LINKEDIN_MIN_JOBS || '75' }}"
+          NAUKRI_LIMIT="${{ vars.NAUKRI_LIMIT || '50' }}"
+          TIMESJOBS_LIMIT="${{ vars.TIMESJOBS_LIMIT || '50' }}"
+          FOUNDIT_LIMIT="${{ vars.FOUNDIT_LIMIT || '50' }}"
+          GLASSDOOR_LIMIT="${{ vars.GLASSDOOR_LIMIT || '50' }}"
+          
+          # Create data directory if it doesn't exist
+          mkdir -p data
+          
+          # Run the scraper with the appropriate parameters
           python job_scraper.py \
-            --keywords "Data Scientist" \
-            --location "India" \
-            --output google_sheets \
+            --keywords "${{ matrix.job_title }}" \
+            --location "$LOCATION" \
+            --output "$OUTPUT" \
+            --excel-filename "data/${SANITIZED_TITLE}_jobs.xlsx" \
             --headless \
-            --linkedin-pages 5 \
-            --linkedin-min-jobs 50 \
-            --naukri-limit 50 \
-            --timesjobs-limit 50 \
-            --foundit-limit 50
+            --linkedin-pages "$LINKEDIN_PAGES" \
+            --linkedin-min-jobs "$LINKEDIN_MIN_JOBS" \
+            --naukri-limit "$NAUKRI_LIMIT" \
+            --timesjobs-limit "$TIMESJOBS_LIMIT" \
+            --foundit-limit "$FOUNDIT_LIMIT" \
+            --glassdoor-limit "$GLASSDOOR_LIMIT" \
+            $SKIP_FLAGS
 
+      # Upload Excel file if generated
       - name: Upload Excel file if generated
         uses: actions/upload-artifact@v3
-        if: ${{ success() && env.OUTPUT_FORMAT == 'excel' }}
+        if: ${{ vars.OUTPUT_FORMAT == 'excel' }}
         with:
-          name: job-listings
-          path: job_listings.xlsx
+          name: ${{ matrix.job_title | replace(' ', '_') }}-jobs
+          path: data/${{ matrix.job_title | replace(' ', '_') | replace('.', '') | replace(',', '') }}_jobs.xlsx
           retention-days: 7
+          
+      # Add job results to workflow summary
+      - name: Add summary
+        run: |
+          echo "### Job Scraper Results for ${{ matrix.job_title }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create sanitized job title for filenames
+          SANITIZED_TITLE=$(echo "${{ matrix.job_title }}" | tr ' ' '_' | tr -d '[:punct:]')
+          
+          if [ -f "data/${SANITIZED_TITLE}_jobs_stats.json" ]; then
+            echo "✅ Completed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Check if jq is installed
+            if ! command -v jq &> /dev/null; then
+              echo "Installing jq..." >> $GITHUB_STEP_SUMMARY
+              sudo apt-get update && sudo apt-get install -y jq
+            fi
+            
+            cat "data/${SANITIZED_TITLE}_jobs_stats.json" | jq -r '
+              "- Total jobs: \(.total_jobs)\n" +
+              "- LinkedIn: \(.linkedin_jobs) jobs\n" +
+              "- Naukri: \(.naukri_jobs) jobs\n" +
+              "- TimesJobs: \(.timesjobs_jobs) jobs\n" +
+              "- Foundit: \(.foundit_jobs) jobs\n" +
+              (if .glassdoor_jobs then "- Glassdoor: \(.glassdoor_jobs) jobs\n" else "" end) +
+              (if .sheet_url then "- [View Results](\(.sheet_url))\n" else "" end)
+            ' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Failed to complete" >> $GITHUB_STEP_SUMMARY
+            
+            # List files in data directory for debugging
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Files in data directory:" >> $GITHUB_STEP_SUMMARY
+            ls -la data/ >> $GITHUB_STEP_SUMMARY 2>&1 || echo "No data directory found" >> $GITHUB_STEP_SUMMARY
+          fi

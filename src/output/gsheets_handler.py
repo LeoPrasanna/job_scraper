@@ -4,11 +4,13 @@ Google Sheets output handler for job scraper results.
 
 import os
 import logging
+import re
 from typing import Dict, List, Any, Optional, Union
 import pandas as pd
 from datetime import datetime
 import json
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log, retry_if_exception_type
+from googleapiclient.errors import HttpError
 
 from src.utils.logger import setup_logger
 from src.utils.config import get_google_credentials
@@ -29,6 +31,11 @@ class GoogleSheetsHandler:
         """
         Authenticate with Google Sheets API.
         
+        Tries multiple authentication methods in the following order:
+        1. Workload Identity Federation (for GitHub Actions)
+        2. Application Default Credentials
+        3. Service account key file
+        
         Returns:
             Tuple of (sheets_service, drive_service) or None if authentication fails
         """
@@ -36,49 +43,76 @@ class GoogleSheetsHandler:
             from googleapiclient.discovery import build
             from google.oauth2 import service_account
             import google.auth
+            from google.auth.exceptions import DefaultCredentialsError
             
-            # Get credentials path
+            # First, try Workload Identity Federation or Application Default Credentials
+            try:
+                self.logger.info("Attempting to authenticate using default credentials (e.g., Workload Identity)")
+                credentials, project = google.auth.default(
+                    scopes=['https://www.googleapis.com/auth/spreadsheets',
+                           'https://www.googleapis.com/auth/drive']
+                )
+                
+                if credentials:
+                    sheets_service = build('sheets', 'v4', credentials=credentials)
+                    drive_service = build('drive', 'v3', credentials=credentials)
+                    
+                    self.logger.info("Successfully authenticated using default credentials")
+                    return sheets_service, drive_service
+            except (DefaultCredentialsError, Exception) as e:
+                self.logger.warning(f"Default credentials authentication failed: {e}")
+            
+            # Fall back to service account key file
             creds_path = get_google_credentials()
             
             if not creds_path:
-                self.logger.error("No Google Sheets credentials found")
-                return None
+                self.logger.error("No Google Sheets credentials found and default auth failed")
+                return None, None
             
-            # Try to authenticate with credentials
-            creds = None
-            
-            if os.path.isfile(creds_path):
-                # Use service account credentials from file
-                scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-                creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
-            else:
-                # The credentials are provided as JSON string
-                try:
-                    service_account_info = json.loads(creds_path)
+            # Try service account authentication
+            try:
+                if os.path.isfile(creds_path):
+                    # Use service account credentials from file
                     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-                    creds = service_account.Credentials.from_service_account_info(
-                        service_account_info, scopes=scopes)
-                except json.JSONDecodeError:
-                    self.logger.error("Invalid credentials JSON")
-                    return None
-            
-            # Build services
-            sheets_service = build('sheets', 'v4', credentials=creds)
-            drive_service = build('drive', 'v3', credentials=creds)
-            
-            return sheets_service, drive_service
-            
+                    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+                else:
+                    # The credentials are provided as JSON string
+                    try:
+                        service_account_info = json.loads(creds_path)
+                        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+                        creds = service_account.Credentials.from_service_account_info(
+                            service_account_info, scopes=scopes)
+                    except json.JSONDecodeError:
+                        self.logger.error("Invalid credentials JSON")
+                        return None, None
+                
+                # Build services
+                sheets_service = build('sheets', 'v4', credentials=creds)
+                drive_service = build('drive', 'v3', credentials=creds)
+                
+                self.logger.info("Successfully authenticated using service account")
+                return sheets_service, drive_service
+                
+            except Exception as auth_err:
+                self.logger.error(f"Service account authentication failed: {auth_err}")
+                return None, None
+                
         except ImportError:
             self.logger.error("Google API client libraries not installed")
-            return None
+            return None, None
         except Exception as e:
             self.logger.error(f"Error authenticating with Google Sheets API: {e}")
-            return None
+            return None, None
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3), 
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((HttpError, ConnectionError)),
+        before_sleep=before_sleep_log(logging.getLogger("output.gsheets"), logging.WARNING)
+    )
     def _create_spreadsheet(self, sheets_service, title):
         """
-        Create a new Google Spreadsheet.
+        Create a new Google Spreadsheet with retry logic.
         
         Args:
             sheets_service: Google Sheets service
@@ -102,10 +136,15 @@ class GoogleSheetsHandler:
         spreadsheet = sheets_service.spreadsheets().create(body=spreadsheet).execute()
         return spreadsheet['spreadsheetId']
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3), 
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((HttpError, ConnectionError)),
+        before_sleep=before_sleep_log(logging.getLogger("output.gsheets"), logging.WARNING)
+    )
     def _create_sharing_permission(self, drive_service, file_id):
         """
-        Create a view-only sharing permission for the spreadsheet.
+        Create a view-only sharing permission for the spreadsheet with retry logic.
         
         Args:
             drive_service: Google Drive service
@@ -126,10 +165,15 @@ class GoogleSheetsHandler:
         
         return permission.get('id')
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3), 
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((HttpError, ConnectionError)),
+        before_sleep=before_sleep_log(logging.getLogger("output.gsheets"), logging.WARNING)
+    )
     def _get_sharing_link(self, drive_service, file_id):
         """
-        Get the sharing link for the spreadsheet.
+        Get the sharing link for the spreadsheet with retry logic.
         
         Args:
             drive_service: Google Drive service
@@ -145,9 +189,15 @@ class GoogleSheetsHandler:
         
         return file.get('webViewLink')
     
+    @retry(
+        stop=stop_after_attempt(3), 
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((HttpError, ConnectionError)),
+        before_sleep=before_sleep_log(logging.getLogger("output.gsheets"), logging.WARNING)
+    )
     def _update_sheet(self, sheets_service, spreadsheet_id, sheet_name, data_df):
         """
-        Update a sheet in the spreadsheet with data.
+        Update a sheet in the spreadsheet with data using retry logic.
         
         Args:
             sheets_service: Google Sheets service
@@ -306,6 +356,13 @@ class GoogleSheetsHandler:
             
             return True
         
+        except HttpError as e:
+            if e.resp.status in [429, 500, 502, 503, 504]:
+                self.logger.warning(f"Temporary API error: {e.resp.status}")
+                raise  # Let retry handle it
+            else:
+                self.logger.error(f"Non-retryable API error: {e}")
+                return False
         except Exception as e:
             self.logger.error(f"Error updating sheet {sheet_name}: {e}")
             return False
@@ -349,8 +406,12 @@ class GoogleSheetsHandler:
                 sheet_title = f"jobslist_{keywords}_{today}"
             
             # Create a new spreadsheet
-            spreadsheet_id = self._create_spreadsheet(sheets_service, sheet_title)
-            
+            try:
+                spreadsheet_id = self._create_spreadsheet(sheets_service, sheet_title)
+            except Exception as e:
+                self.logger.error(f"Failed to create spreadsheet: {e}")
+                return ""
+                
             # Convert job data to DataFrames
             dfs = {}
             all_jobs = []
@@ -398,7 +459,10 @@ class GoogleSheetsHandler:
                 dfs[source] = reorder_columns(dfs[source])
             
             # Update the "All Jobs" sheet
-            self._update_sheet(sheets_service, spreadsheet_id, "All Jobs", all_jobs_df)
+            try:
+                self._update_sheet(sheets_service, spreadsheet_id, "All Jobs", all_jobs_df)
+            except Exception as e:
+                self.logger.error(f"Failed to update All Jobs sheet: {e}")
             
             # Update individual source sheets
             for source, df in dfs.items():
@@ -406,13 +470,23 @@ class GoogleSheetsHandler:
                 if sheet_name.lower() == "naukri":
                     sheet_name = "Naukri.com"
                 
-                self._update_sheet(sheets_service, spreadsheet_id, sheet_name, df)
+                try:
+                    self._update_sheet(sheets_service, spreadsheet_id, sheet_name, df)
+                except Exception as e:
+                    self.logger.error(f"Failed to update {sheet_name} sheet: {e}")
             
             # Set sharing permissions
-            self._create_sharing_permission(drive_service, spreadsheet_id)
+            try:
+                self._create_sharing_permission(drive_service, spreadsheet_id)
+            except Exception as e:
+                self.logger.error(f"Failed to set sharing permissions: {e}")
             
             # Get the sharing link
-            share_url = self._get_sharing_link(drive_service, spreadsheet_id)
+            try:
+                share_url = self._get_sharing_link(drive_service, spreadsheet_id)
+            except Exception as e:
+                self.logger.error(f"Failed to get sharing link: {e}")
+                share_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
             
             self.logger.info(f"Successfully saved {len(all_jobs)} jobs to Google Sheets: {share_url}")
             return share_url
