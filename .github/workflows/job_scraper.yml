@@ -74,6 +74,20 @@ jobs:
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v1
       
+      # Prepare sanitized job title variables
+      - name: Prepare sanitized job titles
+        id: sanitize
+        run: |
+          # Create sanitized job title for filenames
+          JOB_TITLE="${{ matrix.job_title }}"
+          SANITIZED_TITLE=$(echo "$JOB_TITLE" | tr ' ' '_' | tr -d '[:punct:]')
+          ARTIFACT_NAME=$(echo "$JOB_TITLE" | tr ' ' '_')
+          ARTIFACT_PATH=$(echo "$JOB_TITLE" | tr ' ' '_' | tr '.' '' | tr ',' '')
+          
+          echo "sanitized_title=$SANITIZED_TITLE" >> $GITHUB_OUTPUT
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          echo "artifact_path=$ARTIFACT_PATH" >> $GITHUB_OUTPUT
+      
       - name: Run job scraper for ${{ matrix.job_title }}
         run: |
           # Get all settings from repository variables
@@ -108,8 +122,7 @@ jobs:
             SKIP_FLAGS="$SKIP_FLAGS --skip-glassdoor"
           fi
           
-          # Create sanitized job title for filenames
-          SANITIZED_TITLE=$(echo "${{ matrix.job_title }}" | tr ' ' '_' | tr -d '[:punct:]')
+          SANITIZED_TITLE="${{ steps.sanitize.outputs.sanitized_title }}"
           
           echo "Running job scraper for: ${{ matrix.job_title }}"
           echo "Location: $LOCATION"
@@ -147,8 +160,8 @@ jobs:
         uses: actions/upload-artifact@v3
         if: ${{ vars.OUTPUT_FORMAT == 'excel' }}
         with:
-          name: ${{ matrix.job_title | replace(' ', '_') }}-jobs
-          path: data/${{ matrix.job_title | replace(' ', '_') | replace('.', '') | replace(',', '') }}_jobs.xlsx
+          name: ${{ steps.sanitize.outputs.artifact_name }}-jobs
+          path: data/${{ steps.sanitize.outputs.artifact_path }}_jobs.xlsx
           retention-days: 7
           
       # Add job results to workflow summary
@@ -157,8 +170,7 @@ jobs:
           echo "### Job Scraper Results for ${{ matrix.job_title }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Create sanitized job title for filenames
-          SANITIZED_TITLE=$(echo "${{ matrix.job_title }}" | tr ' ' '_' | tr -d '[:punct:]')
+          SANITIZED_TITLE="${{ steps.sanitize.outputs.sanitized_title }}"
           
           if [ -f "data/${SANITIZED_TITLE}_jobs_stats.json" ]; then
             echo "✅ Completed successfully" >> $GITHUB_STEP_SUMMARY
